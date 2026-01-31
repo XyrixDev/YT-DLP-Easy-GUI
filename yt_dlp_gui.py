@@ -1,326 +1,448 @@
-import customtkinter as ctk
-from tkinter import filedialog
-from tkinterdnd2 import TkinterDnD, DND_FILES
-import yt_dlp
-import threading
-import json
 import os
-from datetime import datetime
+import sys
+import json
+import threading
+import time
+import sqlite3
+import re
+import platform
+import psutil
+import urllib.request
+import subprocess
+import uuid
+import datetime
+import io
+import cv2
+import queue
+from collections import deque
+from pathlib import Path
+import tkinter as tk
+from tkinter import messagebox, filedialog
+from tkinterdnd2 import TkinterDnD, DND_FILES
+import customtkinter as ctk
+from PIL import Image, ImageTk
+import yt_dlp
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
 
-# --- Theme Configuration ---
-ctk.set_appearance_mode("dark")
+PALETTE = {
+    "primary": "#6366f1", "secondary": "#4f46e5", "bg_main": "#020617", 
+    "bg_card": "#0f172a", "bg_border": "#1e293b", "text_p": "#f8fafc", 
+    "text_s": "#94a3b8", "accent": "#10b981", "danger": "#ef4444",
+    "warning": "#f59e0b", "cyan": "#06b6d4", "purple": "#a855f7",
+    "slate": "#1e293b", "rose": "#f43f5e", "amber": "#fbbf24",
+    "emerald": "#10b981", "indigolight": "#818cf8"
+}
 
-# Ultra-Modern Palette
-ACCENT = "#60A5FA"      
-ACCENT_HOVER = "#3B82F6"
-SUCCESS = "#10B981"     
-DANGER = "#F43F5E"      
-BG_SIDEBAR = "#0F172A"  
-BG_CONTENT = "#020617"  
-BG_CARD = "#1E293B"     
+class EasyStorage:
+    def __init__(self):
+        self.db_path = "ytdlp_easy_gui_core.db"
+        self._init_db()
 
-SETTINGS_FILE = "settings.json"
-HISTORY_FILE = "history.json"
+    def _init_db(self):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS downloads (
+                    id TEXT PRIMARY KEY,
+                    title TEXT,
+                    url TEXT,
+                    timestamp DATETIME,
+                    container TEXT,
+                    resolution TEXT,
+                    status TEXT,
+                    file_path TEXT
+                )
+            """)
+            conn.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, val TEXT)")
 
-def load_json(path, default):
-    if os.path.exists(path):
+    def log_transaction(self, t, u, c, r, s, p):
         try:
-            with open(path, "r") as f:
-                return {**default, **json.load(f)}
-        except: pass
-    return default
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute("INSERT INTO downloads VALUES (?,?,?,?,?,?,?,?)",
+                             (str(uuid.uuid4()), t, u, datetime.datetime.now(), c, r, s, p))
+        except:
+            pass
 
-def save_json(path, data):
-    with open(path, "w") as f:
-        json.dump(data, f, indent=4)
+class EasyFrame(ctk.CTkFrame):
+    def __init__(self, master, **kwargs):
+        defaults = {"fg_color": PALETTE["bg_card"], "border_color": PALETTE["bg_border"], 
+                    "border_width": 1, "corner_radius": 15}
+        defaults.update(kwargs)
+        super().__init__(master, **defaults)
 
-settings = load_json(SETTINGS_FILE, {"default_output": os.path.expanduser("~/Downloads"), "format": "mp4"})
-history = load_json(HISTORY_FILE, {"items": []})
+class EasyButton(ctk.CTkButton):
+    def __init__(self, master, text="Action", icon=None, **kwargs):
+        h = kwargs.pop("height", 45)
+        f = kwargs.pop("font", ("Inter", 13, "bold"))
+        fg = kwargs.pop("fg_color", PALETTE["bg_border"])
+        txt = f"{icon}  {text}" if icon else text
+        super().__init__(master, text=txt, height=h, font=f, fg_color=fg,
+                         hover_color=PALETTE["primary"], text_color=PALETTE["text_p"],
+                         corner_radius=10, **kwargs)
 
-class NavButton(ctk.CTkButton):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, height=45, corner_radius=10, fg_color="transparent", 
-                         text_color="#94A3B8", hover_color="#334155", anchor="w",
-                         font=("Segoe UI", 13, "bold"), **kwargs)
-
-class HistoryItem:
-    """A sleek card for previously downloaded items"""
-    def __init__(self, parent, data, app):
-        self.frame = ctk.CTkFrame(parent, fg_color=BG_CARD, corner_radius=12, border_width=1, border_color="#334155")
-        self.frame.pack(fill="x", pady=6, padx=10)
-        
-        # Info
-        info_frame = ctk.CTkFrame(self.frame, fg_color="transparent")
-        info_frame.pack(side="left", fill="both", expand=True, padx=15, pady=10)
-        
-        title = data.get("title", "Unknown Title")
-        ctk.CTkLabel(info_frame, text=title[:70] + "..." if len(title) > 70 else title, 
-                     font=("Segoe UI", 13, "bold"), anchor="w").pack(fill="x")
-        
-        ctk.CTkLabel(info_frame, text=f"Downloaded on: {data.get('date', 'N/A')}", 
-                     font=("Segoe UI", 11), text_color="#64748B", anchor="w").pack(fill="x")
-
-        # Redo Button
-        self.redo_btn = ctk.CTkButton(self.frame, text="↺ Redownload", width=110, height=32,
-                                     corner_radius=8, fg_color="#334155", hover_color=ACCENT,
-                                     font=("Segoe UI", 12, "bold"),
-                                     command=lambda: app.add_to_queue(data.get("url")))
-        self.redo_btn.pack(side="right", padx=15)
-
-class QueueItem:
-    def __init__(self, parent, url, title, app):
-        self.url, self.app, self.title, self.state = url, app, title, "waiting"
-        self.frame = ctk.CTkFrame(parent, fg_color=BG_CARD, corner_radius=15, border_width=1, border_color="#334155")
-        self.frame.pack(fill="x", pady=8, padx=15)
-        
-        top = ctk.CTkFrame(self.frame, fg_color="transparent")
-        top.pack(fill="x", padx=15, pady=(12, 5))
-
-        self.label = ctk.CTkLabel(top, text=self.title, font=("Segoe UI", 13, "bold"), anchor="w")
-        self.label.pack(side="left", fill="x", expand=True)
-
-        self.btn_frame = ctk.CTkFrame(top, fg_color="transparent")
-        self.btn_frame.pack(side="right")
-        
-        for icon, cmd, color in [("↑", self.move_up, "#334155"), ("↓", self.move_down, "#334155"), ("✕", self.remove, "#452a2a")]:
-            ctk.CTkButton(self.btn_frame, text=icon, width=28, height=28, corner_radius=8,
-                          fg_color=color, hover_color=ACCENT, command=cmd).pack(side="left", padx=3)
-
-        self.progress = ctk.CTkProgressBar(self.frame, height=10, progress_color=ACCENT, fg_color="#0F172A")
-        self.progress.pack(fill="x", pady=(8, 12), padx=15)
-        self.progress.set(0)
-
-        self.status = ctk.CTkLabel(self.frame, text="Ready", font=("Segoe UI", 11), text_color="#64748B")
-        self.status.pack(side="left", padx=15, pady=(0, 12))
-
-    def remove(self): self.app.remove_item(self)
-    def move_up(self): self.app.move_item(self, -1)
-    def move_down(self): self.app.move_item(self, 1)
-
-class App(TkinterDnD.Tk):
+class YTDLPEasyGUI(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("YT-DLP Pro Edition")
-        self.geometry("1150x800")
-        self.configure(bg=BG_CONTENT)
-
-        self.queue_items, self.is_downloading, self.cancel_flag = [], False, False
-
-        self.grid_columnconfigure(1, weight=1)
-        self.grid_rowconfigure(0, weight=1)
-
-        self.setup_sidebar()
-        self.setup_main_area()
-        self.show_frame("downloader")
         
-        self.drop_target_register(DND_FILES)
-        self.dnd_bind('<<Drop>>', self.handle_drop)
-
-    def setup_sidebar(self):
-        self.sidebar = ctk.CTkFrame(self, width=240, corner_radius=0, fg_color=BG_SIDEBAR)
-        self.sidebar.grid(row=0, column=0, sticky="ns")
-        
-        title_f = ctk.CTkFrame(self.sidebar, fg_color="transparent")
-        title_f.pack(pady=40, padx=20, fill="x")
-        ctk.CTkLabel(title_f, text="YT-DLP", font=("Segoe UI", 32, "bold"), text_color=ACCENT).pack(anchor="w")
-        ctk.CTkLabel(title_f, text="PRO ENGINE", font=("Segoe UI", 11, "bold"), text_color="#475569").pack(anchor="w", padx=2)
-
-        self.nav_btns = {}
-        for text, key in [("📥  Downloads", "downloader"), ("📂  Playlists", "playlist"), ("🕒  History", "history"), ("⚙️  Settings", "settings")]:
-            btn = NavButton(self.sidebar, text=text, command=lambda k=key: self.show_frame(k))
-            btn.pack(fill="x", padx=15, pady=4)
-            self.nav_btns[key] = btn
-
-        self.status_badge = ctk.CTkFrame(self.sidebar, fg_color="#1E293B", corner_radius=12)
-        self.status_badge.pack(side="bottom", fill="x", padx=20, pady=20)
-        ffmpeg_stat = "FFmpeg: OK" if os.path.exists("ffmpeg.exe") else "FFmpeg: Missing"
-        ctk.CTkLabel(self.status_badge, text=ffmpeg_stat, font=("Segoe UI", 12, "bold"), 
-                     text_color=SUCCESS if "OK" in ffmpeg_stat else DANGER).pack(pady=10)
-
-    def setup_main_area(self):
-        self.container = ctk.CTkFrame(self, fg_color="transparent")
-        self.container.grid(row=0, column=1, sticky="nsew", padx=40, pady=30)
-        self.container.grid_columnconfigure(0, weight=1)
-        self.container.grid_rowconfigure(0, weight=1)
-
-        self.frames = {k: getattr(self, f"create_{k}_tab")() for k in ["downloader", "playlist", "history", "settings"]}
-
-    def show_frame(self, key):
-        for k, btn in self.nav_btns.items():
-            btn.configure(fg_color="#2563EB" if k == key else "transparent", text_color="white" if k == key else "#94A3B8")
-        self.frames[key].tkraise()
-        if key == "history": self.refresh_history()
-
-    def create_downloader_tab(self):
-        f = ctk.CTkFrame(self.container, fg_color="transparent")
-        f.grid(row=0, column=0, sticky="nsew")
-        input_card = ctk.CTkFrame(f, fg_color=BG_CARD, corner_radius=20, border_width=1, border_color="#334155")
-        input_card.pack(fill="x", pady=(0, 20))
-        self.url_entry = ctk.CTkEntry(input_card, placeholder_text="Enter Video Link...", height=55, border_width=0, fg_color="transparent", font=("Segoe UI", 15))
-        self.url_entry.pack(fill="x", padx=20, pady=(15, 5))
-        ctrls = ctk.CTkFrame(input_card, fg_color="transparent")
-        ctrls.pack(fill="x", padx=20, pady=(0, 15))
-        self.format_box = ctk.CTkComboBox(ctrls, values=["mp4", "mkv", "mp3", "wav"], width=110, corner_radius=10, fg_color="#0F172A")
-        self.format_box.set(settings["format"]); self.format_box.pack(side="left")
-        ctk.CTkButton(ctrls, text="+ Add to Queue", width=140, height=35, corner_radius=10, fg_color=ACCENT, command=lambda: self.add_to_queue()).pack(side="right")
-        self.queue_container = ctk.CTkScrollableFrame(f, fg_color="#020617", corner_radius=15, border_width=1, border_color="#1E293B")
-        self.queue_container.pack(fill="both", expand=True, pady=10)
-        actions = ctk.CTkFrame(f, fg_color="transparent")
-        actions.pack(fill="x", pady=(15, 0))
-        self.start_btn = ctk.CTkButton(actions, text="INITIALIZE DOWNLOAD ENGINE", font=("Segoe UI", 15, "bold"), height=55, corner_radius=15, fg_color=SUCCESS, command=self.start_queue)
-        self.start_btn.pack(side="left", fill="x", expand=True, padx=(0, 10))
-        ctk.CTkButton(actions, text="Cancel All", width=120, height=55, corner_radius=15, fg_color="#334155", command=self.cancel_download).pack(side="right")
-        return f
-
-    def create_playlist_tab(self):
-        f = ctk.CTkFrame(self.container, fg_color="transparent")
-        f.grid(row=0, column=0, sticky="nsew")
-        ctk.CTkLabel(f, text="Playlist Engine", font=("Segoe UI", 28, "bold")).pack(anchor="w", pady=(0, 20))
-        self.play_entry = ctk.CTkEntry(f, placeholder_text="Paste Playlist Link...", height=55, corner_radius=15)
-        self.play_entry.pack(fill="x", pady=10)
-        self.play_status = ctk.CTkLabel(f, text="Ready", text_color="#64748B")
-        self.play_status.pack(pady=10)
-        ctk.CTkButton(f, text="Start Playlist Processing", height=55, corner_radius=15, fg_color=ACCENT, command=self.start_playlist_dl).pack(fill="x", pady=10)
-        return f
-
-    def create_history_tab(self):
-        f = ctk.CTkFrame(self.container, fg_color="transparent")
-        f.grid(row=0, column=0, sticky="nsew")
-        
-        header = ctk.CTkFrame(f, fg_color="transparent")
-        header.pack(fill="x", pady=(0, 20))
-        ctk.CTkLabel(header, text="Recent Downloads", font=("Segoe UI", 28, "bold")).pack(side="left")
-        ctk.CTkButton(header, text="Clear All", width=100, fg_color="transparent", text_color=DANGER, hover_color="#2a1a1a", command=self.clear_history).pack(side="right", pady=5)
-        
-        self.history_container = ctk.CTkScrollableFrame(f, fg_color="#020617", corner_radius=15, border_width=1, border_color="#1E293B")
-        self.history_container.pack(fill="both", expand=True)
-        return f
-
-    def create_settings_tab(self):
-        f = ctk.CTkFrame(self.container, fg_color="transparent")
-        f.grid(row=0, column=0, sticky="nsew")
-        ctk.CTkLabel(f, text="Preferences", font=("Segoe UI", 28, "bold")).pack(anchor="w", pady=(0, 20))
-        card = ctk.CTkFrame(f, fg_color=BG_CARD, corner_radius=20)
-        card.pack(fill="x")
-        inner = ctk.CTkFrame(card, fg_color="transparent")
-        inner.pack(fill="both", padx=30, pady=30)
-        ctk.CTkLabel(inner, text="Target Directory", font=("Segoe UI", 15, "bold")).pack(anchor="w")
-        loc_f = ctk.CTkFrame(inner, fg_color="transparent")
-        loc_f.pack(fill="x", pady=15)
-        self.default_out = ctk.CTkEntry(loc_f, height=45, corner_radius=10, fg_color="#0F172A")
-        self.default_out.insert(0, settings["default_output"]); self.default_out.pack(side="left", fill="x", expand=True, padx=(0, 10))
-        ctk.CTkButton(loc_f, text="Change Folder", width=120, height=45, corner_radius=10, fg_color="#334155", command=self.browse_out).pack(side="right")
-        ctk.CTkButton(f, text="Apply & Save Settings", height=50, width=250, corner_radius=15, fg_color=ACCENT, command=self.save_settings).pack(pady=30)
-        return f
-
-    # --- Logic ---
-
-    def handle_drop(self, event):
-        data = event.data.strip()
-        if data.startswith('{') and data.endswith('}'): data = data[1:-1]
-        self.url_entry.delete(0, "end"); self.url_entry.insert(0, data)
-
-    def add_to_queue(self, url=None):
-        target_url = url if url else self.url_entry.get().strip()
-        if not target_url: return
-        self.show_frame("downloader")
-        item = QueueItem(self.queue_container, target_url, "Analyzing...", self)
-        self.queue_items.append(item)
-        if not url: self.url_entry.delete(0, "end")
-        threading.Thread(target=self._fetch_title, args=(target_url, item), daemon=True).start()
-
-    def _fetch_title(self, url, item):
         try:
-            with yt_dlp.YoutubeDL({'quiet': True}) as ydl:
-                info = ydl.extract_info(url, download=False)
-                title = info.get('title', url)
-                self.after(0, lambda: item.label.configure(text=title[:80]))
-                item.title = title
-        except: self.after(0, lambda: item.label.configure(text="Video Loaded"))
+            self.tkdnd = TkinterDnD._require(self)
+        except:
+            pass
+            
+        self.title("YT-DLP Easy GUI")
+        self.geometry("1850x1050")
+        self.configure(fg_color=PALETTE["bg_main"])
+        
+        self.bus = queue.Queue()
+        self.db = EasyStorage()
+        self.tabs = {}
+        self.nav_elements = {}
+        self.task_registry = {}
+        self.kill_preview = threading.Event()
+        
+        self.vars = {
+            "url": tk.StringVar(),
+            "target_id": tk.StringVar(),
+            "target_res": tk.StringVar(),
+            "ext": tk.StringVar(value="mp4"),
+            "path": tk.StringVar(value=str(Path.home() / "Downloads")),
+            "t_start": tk.StringVar(value="00:00:00"),
+            "t_end": tk.StringVar(value="00:00:10"),
+            "opt_sponsor": tk.BooleanVar(value=True),
+            "opt_aac": tk.BooleanVar(value=True),
+            "opt_thumb": tk.BooleanVar(value=True),
+            "opt_gpu": tk.BooleanVar(value=True),
+            "opt_subs": tk.BooleanVar(value=False)
+        }
+        
+        self.telemetry_cpu = deque([0]*100, maxlen=100)
+        self.telemetry_net = deque([0]*100, maxlen=100)
+        self.cache_media = None
+        self.cache_playlist = []
 
-    def start_queue(self):
-        if not self.is_downloading:
-            self.start_btn.configure(state="disabled", text="PROCESSING...")
-            threading.Thread(target=self.worker, daemon=True).start()
+        self._build_scaffold()
+        self._ignite_daemons()
 
-    def worker(self):
-        self.is_downloading, self.cancel_flag = True, False
-        for item in self.queue_items:
-            if item.state != "waiting" or self.cancel_flag: continue
-            try:
-                def hook(d):
-                    if self.cancel_flag: raise Exception("Stop")
-                    if d['status'] == 'downloading':
-                        total = d.get('total_bytes') or d.get('total_bytes_estimate', 1)
-                        p = d.get('downloaded_bytes', 0) / total
-                        self.after(0, lambda: self._update_ui(item, p, d.get('speed', 0)))
-                
-                fmt = self.format_box.get()
-                opts = {'format': 'bestvideo+bestaudio/best' if fmt in ['mp4', 'mkv'] else 'bestaudio/best',
-                        'outtmpl': os.path.join(settings["default_output"], '%(title)s.%(ext)s'),
-                        'progress_hooks': [hook], 'noplaylist': True}
-                if fmt in ['mp3', 'wav']: opts['postprocessors'] = [{'key': 'FFmpegExtractAudio', 'preferredcodec': fmt}]
+    def _build_scaffold(self):
+        self.sidebar = ctk.CTkFrame(self, width=320, corner_radius=0, fg_color=PALETTE["bg_main"])
+        self.sidebar.pack(side="left", fill="y")
+        
+        ctk.CTkLabel(self.sidebar, text="YT-DLP", font=("Inter", 48, "bold"), text_color=PALETTE["primary"]).pack(pady=(60,0))
+        ctk.CTkLabel(self.sidebar, text="Easy GUI - v0.02", font=("Inter", 11, "bold"), text_color=PALETTE["text_s"]).pack(pady=(0,50))
 
-                with yt_dlp.YoutubeDL(opts) as ydl: ydl.download([item.url])
-                item.state = "finished"
-                self.after(0, lambda: item.status.configure(text="✔ Success", text_color=SUCCESS))
-                self.log_history(item.title, item.url)
-            except Exception:
-                item.state = "error"
-                self.after(0, lambda: item.status.configure(text="✖ Stopped", text_color=DANGER))
-        self.is_downloading = False
-        self.after(0, lambda: self.start_btn.configure(state="normal", text="INITIALIZE DOWNLOAD ENGINE"))
+        nav = [
+            ("Dashboard", "⚡"), ("Playlist Engine", "🧬"), ("Clip Surgeon", "✂️"), 
+            ("Live Monitor", "📡"), ("Execution Queue", "🔋"), ("Log History", "📜"), 
+            ("System Telemetry", "📊"), ("Global Config", "🛠️")
+        ]
+        
+        for name, icon in nav:
+            b = EasyButton(self.sidebar, text=name, icon=icon, width=260, anchor="w", command=lambda n=name: self.navigate(n))
+            b.pack(pady=4, padx=30)
+            self.nav_elements[name] = b
 
-    def _update_ui(self, item, p, speed):
-        item.progress.set(p)
-        mb = speed/1024/1024 if speed else 0
-        item.status.configure(text=f"{mb:.2f} MB/s | {int(p*100)}%", text_color=ACCENT)
+        self.screen = ctk.CTkFrame(self, fg_color="transparent")
+        self.screen.pack(side="right", fill="both", expand=True, padx=40, pady=40)
 
-    def log_history(self, title, url):
-        history["items"].insert(0, {"title": title, "url": url, "date": datetime.now().strftime("%d %b, %H:%M")})
-        save_json(HISTORY_FILE, history)
+        self._ui_dashboard()
+        self._ui_playlist()
+        self._ui_surgeon()
+        self._ui_monitor()
+        self._ui_queue()
+        self._ui_logs()
+        self._ui_telemetry()
+        self._ui_config()
+        
+        self.navigate("Dashboard")
 
-    def refresh_history(self):
-        for widget in self.history_container.winfo_children(): widget.destroy()
-        for i in history["items"]: HistoryItem(self.history_container, i, self)
+    def _ui_dashboard(self):
+        p = ctk.CTkFrame(self.screen, fg_color="transparent")
+        self.tabs["Dashboard"] = p
+        
+        h = EasyFrame(p, height=130)
+        h.pack(fill="x", pady=(0, 25))
+        h.pack_propagate(False)
+        
+        self.url_bar = ctk.CTkEntry(h, textvariable=self.vars["url"], placeholder_text="REACH PROTOCOL: Input Media URL...", height=55, font=("Inter", 15), border_color=PALETTE["bg_border"], fg_color=PALETTE["bg_main"])
+        self.url_bar.pack(side="left", fill="x", expand=True, padx=30)
+        
+        EasyButton(h, text="INITIALIZE SCAN", width=180, fg_color=PALETTE["primary"], command=self.op_scan).pack(side="right", padx=30)
 
-    def clear_history(self):
-        history["items"] = []
-        save_json(HISTORY_FILE, history)
-        self.refresh_history()
+        split = ctk.CTkFrame(p, fg_color="transparent")
+        split.pack(fill="both", expand=True)
 
-    def browse_out(self):
-        folder = filedialog.askdirectory()
-        if folder: self.default_out.delete(0, "end"); self.default_out.insert(0, folder)
+        self.res_shell = EasyFrame(split)
+        self.res_shell.pack(side="left", fill="both", expand=True, padx=(0, 15))
+        ctk.CTkLabel(self.res_shell, text="RESOLUTION MANIFEST", font=("Inter", 13, "bold"), text_color=PALETTE["text_s"]).pack(pady=20)
+        
+        self.res_scroll = ctk.CTkScrollableFrame(self.res_shell, fg_color="transparent")
+        self.res_scroll.pack(fill="both", expand=True, padx=15, pady=10)
 
-    def save_settings(self):
-        settings.update({"default_output": self.default_out.get(), "format": self.format_box.get()})
-        save_json(SETTINGS_FILE, settings)
+        self.info_pane = EasyFrame(split, width=450)
+        self.info_pane.pack(side="right", fill="y")
+        self.info_pane.pack_propagate(False)
 
-    def start_playlist_dl(self):
-        url = self.play_entry.get().strip()
-        if not url: return
-        threading.Thread(target=self._playlist_worker, args=(url,), daemon=True).start()
+        self.viz_preview = ctk.CTkLabel(self.info_pane, text="IDLE_WAITING_FOR_INPUT", width=390, height=220, fg_color="#000", corner_radius=12)
+        self.viz_preview.pack(pady=25, padx=25)
 
-    def _playlist_worker(self, url):
-        self.after(0, lambda: self.play_status.configure(text="Gathering playlist..."))
+        self.meta_box = ctk.CTkFrame(self.info_pane, fg_color="transparent")
+        self.meta_box.pack(fill="x", padx=40)
+        
+        ctk.CTkLabel(self.meta_box, text="TARGET ENCODING", font=("Inter", 10, "bold"), text_color=PALETTE["text_s"]).pack(anchor="w")
+        ctk.CTkSegmentedButton(self.meta_box, variable=self.vars["ext"], values=["mp4", "mkv", "mp3", "wav"], height=45, selected_color=PALETTE["secondary"], fg_color=PALETTE["bg_main"]).pack(fill="x", pady=15)
+
+        self.btn_run = EasyButton(self.info_pane, text="EXECUTE FULL DEPLOY", height=80, fg_color=PALETTE["emerald"], state="disabled", command=self.op_download_full)
+        self.btn_run.pack(side="bottom", fill="x", padx=40, pady=40)
+
+    def _ui_surgeon(self):
+        p = ctk.CTkFrame(self.screen, fg_color="transparent")
+        self.tabs["Clip Surgeon"] = p
+        w = EasyFrame(p); w.pack(expand=True, fill="both", padx=80, pady=80)
+        ctk.CTkLabel(w, text="TEMPORAL CLIP EXTRACTION", font=("Inter", 32, "bold")).pack(pady=(60,15))
+        ctk.CTkLabel(w, text="Nondestructive extraction using stream-copy architecture.", text_color=PALETTE["text_s"]).pack(pady=(0,50))
+        rs = ctk.CTkFrame(w, fg_color="transparent"); rs.pack(pady=25)
+        st = {"font": ("JetBrains Mono", 28), "width": 240, "height": 70, "justify": "center", "fg_color": PALETTE["bg_main"], "border_color": PALETTE["bg_border"]}
+        ls = ctk.CTkFrame(rs, fg_color="transparent"); ls.pack(side="left", padx=50)
+        ctk.CTkLabel(ls, text="VECTOR START (HH:MM:SS)", font=("Inter", 11, "bold")).pack(pady=10)
+        ctk.CTkEntry(ls, textvariable=self.vars["t_start"], **st).pack()
+        rx = ctk.CTkFrame(rs, fg_color="transparent"); rx.pack(side="left", padx=50)
+        ctk.CTkLabel(rx, text="VECTOR END (HH:MM:SS)", font=("Inter", 11, "bold")).pack(pady=10)
+        ctk.CTkEntry(rx, textvariable=self.vars["t_end"], **st).pack()
+        EasyButton(w, text="INJECT EXTRACTION TASK", fg_color=PALETTE["warning"], width=450, height=80, command=self.op_download_clip).pack(pady=60)
+
+    def _ui_playlist(self):
+        p = ctk.CTkFrame(self.screen, fg_color="transparent")
+        self.tabs["Playlist Engine"] = p
+        self.pl_list = ctk.CTkScrollableFrame(p, fg_color=PALETTE["bg_card"], border_width=1, border_color=PALETTE["bg_border"])
+        self.pl_list.pack(fill="both", expand=True, pady=(0,25))
+        EasyButton(p, text="QUEUE ALL VALIDATED ENTRIES", height=70, fg_color=PALETTE["primary"], command=self.op_bulk).pack(fill="x")
+
+    def _ui_monitor(self):
+        p = ctk.CTkFrame(self.screen, fg_color="transparent")
+        self.tabs["Live Monitor"] = p
+        self.mon_canv = tk.Canvas(p, bg="#000", highlightthickness=0)
+        self.mon_canv.pack(fill="both", expand=True, padx=15, pady=15)
+        EasyButton(p, text="ACTIVATE STREAM INTERCEPT", width=300, command=self.op_preview).pack(pady=15)
+
+    def _ui_queue(self):
+        p = ctk.CTkFrame(self.screen, fg_color="transparent")
+        self.tabs["Execution Queue"] = p
+        self.q_scroll = ctk.CTkScrollableFrame(p, fg_color="transparent")
+        self.q_scroll.pack(fill="both", expand=True)
+
+    def _ui_logs(self):
+        p = ctk.CTkFrame(self.screen, fg_color="transparent")
+        self.tabs["Log History"] = p
+        self.log_scroll = ctk.CTkScrollableFrame(p, fg_color="transparent")
+        self.log_scroll.pack(fill="both", expand=True)
+
+    def _ui_telemetry(self):
+        p = ctk.CTkFrame(self.screen, fg_color="transparent")
+        self.tabs["System Telemetry"] = p
+        self.tel_fig = Figure(figsize=(12, 6), facecolor=PALETTE["bg_card"])
+        self.tel_ax = self.tel_fig.add_subplot(111)
+        self.tel_ax.set_facecolor(PALETTE["bg_card"])
+        self.tel_canv = FigureCanvasTkAgg(self.tel_fig, master=p)
+        self.tel_canv.get_tk_widget().pack(fill="both", expand=True)
+
+    def _ui_config(self):
+        p = ctk.CTkScrollableFrame(self.screen, fg_color="transparent")
+        self.tabs["Global Config"] = p
+        def row(txt, v):
+            f = EasyFrame(p); f.pack(fill="x", pady=6)
+            ctk.CTkLabel(f, text=txt, font=("Inter", 14)).pack(side="left", padx=30, pady=25)
+            ctk.CTkSwitch(f, text="", variable=v, progress_color=PALETTE["primary"]).pack(side="right", padx=30)
+        row("Force AAC Transcoding (Windows Compatibility Layer)", self.vars["opt_aac"])
+        row("Nvidia/AMD/Intel Hardware Acceleration", self.vars["opt_gpu"])
+        row("SponsorBlock API Deep Packet Inspection", self.vars["opt_sponsor"])
+        row("Atomic Metadata & Thumbnail Injection", self.vars["opt_thumb"])
+        row("Sub-orbital Auto-Subtitle Fetching", self.vars["opt_subs"])
+
+    def _ignite_daemons(self):
+        threading.Thread(target=self._tel_loop, daemon=True).start()
+        self._signal_processor()
+
+    def _signal_processor(self):
+        while not self.bus.empty():
+            sig = self.bus.get()
+            tid = sig['id']
+            if tid in self.task_registry:
+                m = self.task_registry[tid]
+                if sig['type'] == 'p':
+                    m['pb'].set(sig['v'] / 100)
+                    m['tx'].configure(text=f"{sig['v']}% | {sig['s']} | ETA: {sig['e']}")
+                elif sig['type'] == 'f':
+                    m['tx'].configure(text="STATUS: COMPLETE", text_color=PALETTE["emerald"])
+                    m['pb'].set(1.0)
+                elif sig['type'] == 'e':
+                    m['tx'].configure(text="STATUS: FATAL_ERROR", text_color=PALETTE["danger"])
+        self.after(50, self._signal_processor)
+
+    def _tel_loop(self):
+        while True:
+            self.telemetry_cpu.append(psutil.cpu_percent())
+            self.tel_ax.clear()
+            self.tel_ax.plot(list(self.telemetry_cpu), color=PALETTE["primary"], linewidth=2)
+            self.tel_ax.fill_between(range(len(self.telemetry_cpu)), list(self.telemetry_cpu), color=PALETTE["primary"], alpha=0.1)
+            try: self.tel_canv.draw()
+            except: pass
+            time.sleep(1)
+
+    def navigate(self, n):
+        if n != "Live Monitor": self.kill_preview.set()
+        for k, v in self.tabs.items():
+            if k == n: v.pack(fill="both", expand=True)
+            else: v.pack_forget()
+        for k, b in self.nav_elements.items():
+            b.configure(fg_color=PALETTE["primary"] if k == n else PALETTE["bg_border"])
+
+    def op_scan(self):
+        u = self.vars["url"].get()
+        if not u: return
+        self.btn_run.configure(text="SCANNING KERNEL...", state="disabled")
+        threading.Thread(target=self._scan_kernel, args=(u,), daemon=True).start()
+
+    def _scan_kernel(self, u):
         try:
-            opts = {'outtmpl': os.path.join(settings["default_output"], '%(playlist_title)s/%(title)s.%(ext)s'), 'quiet': True}
-            with yt_dlp.YoutubeDL(opts) as ydl: ydl.download([url])
-            self.after(0, lambda: self.play_status.configure(text="✔ Playlist Complete!", text_color=SUCCESS))
-        except: self.after(0, lambda: self.play_status.configure(text="✖ Error", text_color=DANGER))
+            with yt_dlp.YoutubeDL({'quiet': True, 'extract_flat': 'in_playlist'}) as ydl:
+                meta = ydl.extract_info(u, download=False)
+                if 'entries' in meta: self.after(0, lambda: self._render_playlist(meta))
+                else: self.after(0, lambda: self._render_single(meta))
+        except Exception as e: self.after(0, lambda: messagebox.showerror("IO_ERROR", str(e)))
 
-    def cancel_download(self): self.cancel_flag = True
-    def remove_item(self, item): 
-        item.frame.destroy()
-        if item in self.queue_items: self.queue_items.remove(item)
-    def move_item(self, item, direction):
-        idx = self.queue_items.index(item)
-        new_idx = idx + direction
-        if 0 <= new_idx < len(self.queue_items):
-            self.queue_items[idx], self.queue_items[new_idx] = self.queue_items[new_idx], self.queue_items[idx]
-            for i in self.queue_items: i.frame.pack_forget()
-            for i in self.queue_items: i.frame.pack(fill="x", pady=8, padx=15)
+    def _render_single(self, m):
+        self.cache_media = m
+        for w in self.res_scroll.winfo_children(): w.destroy()
+        fmts = sorted([f for f in m.get('formats',[]) if f.get('height')], key=lambda x: x['height'], reverse=True)
+        found = set()
+        for f in fmts:
+            h = f['height']
+            if h not in found:
+                found.add(h)
+                fid = f['format_id']
+                ctk.CTkRadioButton(self.res_scroll, text=f"{h}P | {f['ext'].upper()} | {f.get('vcodec','NULL')[:8]}", 
+                                   variable=self.vars["target_id"], value=fid, 
+                                   command=lambda res=h: self.vars["target_res"].set(str(res))).pack(anchor="w", pady=8, padx=25)
+        threading.Thread(target=self._get_thumb, args=(m.get('thumbnail'),), daemon=True).start()
+        self.btn_run.configure(text="EXECUTE FULL DEPLOY", state="normal")
+
+    def _get_thumb(self, u):
+        try:
+            r = urllib.request.urlopen(u).read()
+            i = Image.open(io.BytesIO(r)).resize((390, 220), Image.LANCZOS)
+            p = ctk.CTkImage(i, size=(390, 220))
+            self.after(0, lambda: self.viz_preview.configure(image=p, text=""))
+        except: pass
+
+    def op_download_full(self):
+        self.navigate("Execution Queue")
+        self._spawn_worker(self.cache_media['title'], self.cache_media['webpage_url'])
+
+    def op_download_clip(self):
+        if not self.cache_media: return
+        self.navigate("Execution Queue")
+        self._spawn_worker(f"{self.cache_media['title']}_SURGERY", self.cache_media['webpage_url'], surgical=True)
+
+    def _spawn_worker(self, t, u, surgical=False):
+        tid = str(uuid.uuid4())
+        c = EasyFrame(self.q_scroll, height=110); c.pack(fill="x", pady=6, padx=20); c.pack_propagate(False)
+        ctk.CTkLabel(c, text=t[:65], font=("Inter", 13, "bold")).pack(side="left", padx=30)
+        p = ctk.CTkProgressBar(c, width=350, progress_color=PALETTE["primary"]); p.set(0); p.pack(side="left", padx=25)
+        l = ctk.CTkLabel(c, text="HANDSHAKING...", font=("JetBrains Mono", 11)); l.pack(side="left")
+        self.task_registry[tid] = {'pb': p, 'tx': l}
+        threading.Thread(target=self._dl_engine, args=(tid, u, t, surgical), daemon=True).start()
+
+    def _dl_engine(self, tid, u, t, surg):
+        ext = self.vars["ext"].get()
+        fid = self.vars["target_id"].get()
+        
+        def h(d):
+            if d['status'] == 'downloading':
+                try:
+                    v = float(d.get('_percent_str', '0%').replace('%','').strip())
+                    self.bus.put({'id': tid, 'type': 'p', 'v': v, 's': d.get('_speed_str','0B/s'), 'e': d.get('_eta_str','00:00')})
+                except: pass
+
+        opts = {
+            'format': f"{fid}+bestaudio/best" if fid else "bestvideo+bestaudio/best",
+            'outtmpl': os.path.join(self.vars["path"].get(), "%(title)s.%(ext)s"),
+            'progress_hooks': [h],
+            'merge_output_format': ext if ext in ['mp4', 'mkv'] else None,
+            'postprocessors': []
+        }
+
+        if ext == 'mp4' and self.vars["opt_aac"].get():
+            opts['postprocessors'].append({'key': 'FFmpegVideoConvertor', 'preferedformat': 'mp4'})
+            opts['postprocessor_args'] = ['-c:a', 'aac', '-b:a', '192k']
+
+        if surg:
+            s_t = self._t_parse(self.vars["t_start"].get())
+            e_t = self._t_parse(self.vars["t_end"].get())
+            opts['download_ranges'] = lambda info, dict: [{'start_time': s_t, 'end_time': e_t}]
+            opts['force_keyframes_at_cuts'] = True
+
+        if self.vars["opt_sponsor"].get():
+            opts['postprocessors'].append({'key': 'SponsorBlock'})
+            opts['postprocessors'].append({'key': 'ModifyChapters', 'remove_sponsor_segments': ['sponsor', 'intro', 'outro', 'selfpromo']})
+
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.download([u])
+            self.bus.put({'id': tid, 'type': 'f'})
+            self.db.log_transaction(t, u, ext, self.vars["target_res"].get(), "SUCCESS", self.vars["path"].get())
+        except:
+            self.bus.put({'id': tid, 'type': 'e'})
+
+    def _t_parse(self, ts):
+        try:
+            v = list(map(int, ts.split(':')))
+            if len(v) == 3: return v[0]*3600 + v[1]*60 + v[2]
+            return v[0]*60 + v[1]
+        except: return 0
+
+    def op_preview(self):
+        if not self.cache_media: return
+        self.kill_preview.clear()
+        threading.Thread(target=self._prev_engine, daemon=True).start()
+
+    def _prev_engine(self):
+        u = self.cache_media['webpage_url']
+        try:
+            with yt_dlp.YoutubeDL({'format': 'best[height<=360]'}) as ydl:
+                raw = ydl.extract_info(u, download=False)['url']
+            cap = cv2.VideoCapture(raw)
+            while not self.kill_preview.is_set():
+                ok, f = cap.read()
+                if not ok: break
+                rgb = cv2.cvtColor(f, cv2.COLOR_BGR2RGB)
+                im = Image.fromarray(rgb).resize((self.mon_canv.winfo_width(), self.mon_canv.winfo_height()))
+                tk_im = ImageTk.PhotoImage(image=im)
+                self.after(0, lambda x=tk_im: self._prev_draw(x))
+                time.sleep(0.03)
+            cap.release()
+        except: pass
+
+    def _prev_draw(self, x):
+        self.mon_canv.create_image(0, 0, anchor="nw", image=x)
+        self.mon_canv.image = x
+
+    def _render_playlist(self, m):
+        self.navigate("Playlist Engine")
+        for w in self.pl_list.winfo_children(): w.destroy()
+        self.cache_playlist = []
+        for ent in m['entries']:
+            v = tk.BooleanVar(value=True)
+            r = ctk.CTkFrame(self.pl_list, fg_color="transparent"); r.pack(fill="x", pady=3)
+            ctk.CTkCheckBox(r, text=ent.get('title', 'ENTRY_NULL'), variable=v, font=("Inter", 12), checkbox_color=PALETTE["primary"]).pack(side="left", padx=25)
+            self.cache_playlist.append((v, ent.get('title'), ent.get('url') or ent.get('webpage_url')))
+
+    def op_bulk(self):
+        self.navigate("Execution Queue")
+        for v, t, u in self.cache_playlist:
+            if v.get(): self._spawn_worker(t, u)
 
 if __name__ == "__main__":
-    App().mainloop()
+    ctk.set_appearance_mode("dark")
+    app = YTDLPEasyGUI()
+    app.mainloop()
