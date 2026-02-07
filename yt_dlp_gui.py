@@ -117,7 +117,6 @@ class YTDLPEasyGUI(ctk.CTk):
         }
         
         self.telemetry_cpu = deque([0]*100, maxlen=100)
-        self.telemetry_net = deque([0]*100, maxlen=100)
         self.cache_media = None
         self.cache_playlist = []
 
@@ -364,34 +363,59 @@ class YTDLPEasyGUI(ctk.CTk):
                     self.bus.put({'id': tid, 'type': 'p', 'v': v, 's': d.get('_speed_str','0B/s'), 'e': d.get('_eta_str','00:00')})
                 except: pass
 
+        # Basic Format Selection
         opts = {
             'format': f"{fid}+bestaudio/best" if fid else "bestvideo+bestaudio/best",
             'outtmpl': os.path.join(self.vars["path"].get(), "%(title)s.%(ext)s"),
             'progress_hooks': [h],
-            'merge_output_format': ext if ext in ['mp4', 'mkv'] else None,
             'postprocessors': []
         }
 
-        if ext == 'mp4' and self.vars["opt_aac"].get():
-            opts['postprocessors'].append({'key': 'FFmpegVideoConvertor', 'preferedformat': 'mp4'})
-            opts['postprocessor_args'] = ['-c:a', 'aac', '-b:a', '192k']
+        # --- FIX: Handle Audio Extraction (MP3/WAV) ---
+        if ext in ['mp3', 'wav']:
+            opts['format'] = 'bestaudio/best'
+            opts['postprocessors'].append({
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': ext,
+                'preferredquality': '192',
+            })
+        
+        # --- FIX: Handle Video Container (MP4/MKV) ---
+        elif ext in ['mp4', 'mkv']:
+            opts['merge_output_format'] = ext
+            if ext == 'mp4' and self.vars["opt_aac"].get():
+                opts['postprocessors'].append({'key': 'FFmpegVideoConvertor', 'preferedformat': 'mp4'})
+                opts['postprocessor_args'] = ['-c:a', 'aac', '-b:a', '192k']
 
+        # Temporal Clipping
         if surg:
             s_t = self._t_parse(self.vars["t_start"].get())
             e_t = self._t_parse(self.vars["t_end"].get())
             opts['download_ranges'] = lambda info, dict: [{'start_time': s_t, 'end_time': e_t}]
             opts['force_keyframes_at_cuts'] = True
 
+        # SponsorBlock Logic
         if self.vars["opt_sponsor"].get():
             opts['postprocessors'].append({'key': 'SponsorBlock'})
             opts['postprocessors'].append({'key': 'ModifyChapters', 'remove_sponsor_segments': ['sponsor', 'intro', 'outro', 'selfpromo']})
+
+        # Thumbnail & Metadata Logic
+        if self.vars["opt_thumb"].get():
+            opts['postprocessors'].append({'key': 'EmbedThumbnail'})
+            opts['postprocessors'].append({'key': 'FFmpegMetadata'})
+
+        # Subtitles
+        if self.vars["opt_subs"].get():
+            opts['writesubtitles'] = True
+            opts['subtitleslangs'] = ['en.*']
 
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 ydl.download([u])
             self.bus.put({'id': tid, 'type': 'f'})
             self.db.log_transaction(t, u, ext, self.vars["target_res"].get(), "SUCCESS", self.vars["path"].get())
-        except:
+        except Exception as e:
+            print(f"Error executing task: {e}")
             self.bus.put({'id': tid, 'type': 'e'})
 
     def _t_parse(self, ts):
